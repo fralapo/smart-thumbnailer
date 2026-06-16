@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Output
+thumbnails/
+out/
+
+# Downloaded models (large binary files)
+models/*.caffemodel
+models/*.pb
+models/*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
