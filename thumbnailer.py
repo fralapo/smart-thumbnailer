@@ -82,22 +82,22 @@ def auto_top_k(duration_sec: float) -> int:
     Choose how many thumbnails to extract based on video length.
 
     Scale:
-      < 3 min  -> 1
-      3-8 min  -> 2
-      8-20 min -> 3
-      20-40    -> 4
-      40-70    -> 5
-      70-120   -> 6
-      > 120    -> 7  (capped at 10)
+      < 3 min  -> 2
+      3-8 min  -> 4
+      8-20 min -> 6
+      20-40    -> 8
+      40-70    -> 9
+      70-120   -> 10
+      > 120    -> 10 (capped)
     """
     m = duration_sec / 60.0
-    if m < 3:   return 1
-    if m < 8:   return 2
-    if m < 20:  return 3
-    if m < 40:  return 4
-    if m < 70:  return 5
-    if m < 120: return 6
-    return min(7 + int((m - 120) / 30), 10)
+    if m < 3:   return 2
+    if m < 8:   return 4
+    if m < 20:  return 6
+    if m < 40:  return 8
+    if m < 70:  return 9
+    if m < 120: return 10
+    return 10
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +114,7 @@ class FrameCandidate:
     contrast_raw:     float = 0.0
     exposure_score:   float = 0.0
     face_score:       float = 0.0
+    face_count:       int   = 0
     colorfulness_raw: float = 0.0
     saliency_raw:     float = 0.0
     stability_score:  float = 100.0
@@ -130,7 +131,34 @@ class FrameCandidate:
 # ---------------------------------------------------------------------------
 
 def laplacian_sharpness(gray: np.ndarray) -> float:
+    """Fast blur detector for the pre-filter stage."""
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def tenengrad_sharpness(gray: np.ndarray) -> float:
+    """
+    Tenengrad sharpness (Sobel gradient energy) with Gaussian center weighting.
+    Inspired by sharp-frame-extractor (cansik/github).
+
+    Center-weighting improves selection for portrait-framed subjects:
+    - Edge energy in the frame center counts more
+    - Avoids picking frames sharp only at the edges/background
+    - sigma_fraction = 0.22 matches the sharp-frame-extractor default
+    """
+    g = gray.astype("float32")
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    g2 = gx * gx + gy * gy
+
+    h, w = g2.shape
+    sigma_y = max(1.0, h * 0.22)
+    sigma_x = max(1.0, w * 0.22)
+    ky = cv2.getGaussianKernel(h, sigma_y, ktype=cv2.CV_32F)
+    kx = cv2.getGaussianKernel(w, sigma_x, ktype=cv2.CV_32F)
+    weights = (ky @ kx.T).astype("float32")
+    weights /= float(weights.sum())
+
+    return float((g2 * weights).sum())
 
 
 def colorfulness_hs(bgr: np.ndarray) -> float:
@@ -175,7 +203,7 @@ def face_score_from_count(n: int) -> float:
     return [0.0, 70.0, 85.0, 100.0][min(n, 3)]
 
 
-def detect_faces(net: cv2.dnn.Net, bgr: np.ndarray, conf_thresh: float = 0.65) -> int:
+def detect_faces(net: cv2.dnn.Net, bgr: np.ndarray, conf_thresh: float = 0.50) -> int:
     blob = cv2.dnn.blobFromImage(
         cv2.resize(bgr, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0)
     )
@@ -235,6 +263,34 @@ def load_face_detector() -> Optional[cv2.dnn.Net]:
     except Exception as e:
         print(f"Warning: cannot load face detector — {e}", file=sys.stderr)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Rotation correction (phone videos, action cameras, etc.)
+# ---------------------------------------------------------------------------
+
+def get_video_rotation(cap: cv2.VideoCapture) -> int:
+    """
+    Read rotation metadata from video stream (OpenCV 4.5+).
+    Phone and action-camera videos often embed 90/270-deg rotation tags.
+    Returns 0, 90, 180, or 270.
+    """
+    try:
+        angle = int(cap.get(cv2.CAP_PROP_ORIENTATION_META))
+        return angle if angle in (90, 180, 270) else 0
+    except Exception:
+        return 0
+
+
+def apply_rotation(frame: np.ndarray, angle: int) -> np.ndarray:
+    """Counterrotate frame to correct for video orientation metadata."""
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +488,7 @@ def get_scene_sample_times(
 # Output helpers
 # ---------------------------------------------------------------------------
 
-def write_html_preview(html_path: str, results: List[dict]) -> None:
+def write_html_preview(html_path: str, results: List[dict], faces_disabled: bool = False) -> None:
     """Self-contained HTML with base64-embedded thumbnails and metric bars."""
     METRIC_LABELS = {
         "sharpness":    "Sharp",
@@ -449,12 +505,35 @@ def write_html_preview(html_path: str, results: List[dict]) -> None:
         with open(r["_abs_path"], "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode()
 
-        bars = "".join(
-            f'<div class="m"><span class="ml">{METRIC_LABELS.get(k, k)}</span>'
-            f'<div class="bw"><div class="b" style="width:{v:.0f}%"></div></div>'
-            f'<span class="mv">{v:.0f}</span></div>'
-            for k, v in r["metrics"].items()
-        )
+        bars_html = []
+        for k, v in r["metrics"].items():
+            if k == "face_count":
+                continue  # skip raw count; rendered via "faces" row
+            label = METRIC_LABELS.get(k, k)
+            if k == "faces":
+                if faces_disabled:
+                    bars_html.append(
+                        f'<div class="m">'
+                        f'<span class="ml">{label}</span>'
+                        f'<div class="bw"><div class="b" style="width:0%;background:#333"></div></div>'
+                        f'<span class="mv" style="color:#444">N/A</span></div>'
+                    )
+                else:
+                    fc = r["metrics"].get("face_count", 0)
+                    suffix = f" ({fc})" if fc else ""
+                    bars_html.append(
+                        f'<div class="m">'
+                        f'<span class="ml">{label}{suffix}</span>'
+                        f'<div class="bw"><div class="b" style="width:{v:.0f}%"></div></div>'
+                        f'<span class="mv">{v:.0f}</span></div>'
+                    )
+            else:
+                bars_html.append(
+                    f'<div class="m"><span class="ml">{label}</span>'
+                    f'<div class="bw"><div class="b" style="width:{v:.0f}%"></div></div>'
+                    f'<span class="mv">{v:.0f}</span></div>'
+                )
+        bars = "".join(bars_html)
         cards += f"""
 <div class="card">
   <img src="data:image/jpeg;base64,{b64}" alt="#{r['rank']}">
@@ -539,6 +618,7 @@ def extract_thumbnails(
     fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration     = total_frames / fps if fps > 0 else 0.0
+    rotation     = get_video_rotation(cap)
 
     if duration < 1.0:
         raise RuntimeError("Video too short or unreadable.")
@@ -557,6 +637,8 @@ def extract_thumbnails(
     print(f"Video    : {os.path.basename(video_path)}")
     print(f"Duration : {mins_t}m{secs_t:02d}s  |  FPS: {fps:.2f}  |  Frames: {total_frames}")
     print(f"Skip     : first {skip_start:.0f}s + last {duration - skip_end:.0f}s")
+    if rotation:
+        print(f"Rotation : {rotation} deg (auto-correcting frames)")
     if top_k_auto:
         print(f"Thumbs   : {top_k}  (auto, {mins_t}m video)")
     else:
@@ -606,17 +688,17 @@ def extract_thumbnails(
         if not ok:
             continue
 
+        frame      = apply_rotation(frame, rotation)
         gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         brightness = float(gray.mean())
 
         if brightness < MIN_BRIGHTNESS or brightness > MAX_BRIGHTNESS:
             continue
-        sharpness_raw = laplacian_sharpness(gray)
-        if sharpness_raw < MIN_SHARPNESS_RAW:
+        if laplacian_sharpness(gray) < MIN_SHARPNESS_RAW:
             continue
 
         c = FrameCandidate(time_sec=t, frame=frame.copy())
-        c.sharpness_raw    = sharpness_raw
+        c.sharpness_raw    = tenengrad_sharpness(gray)
         c.contrast_raw     = float(gray.std())
         c.exposure_score   = exposure_score(brightness)
         c.colorfulness_raw = colorfulness_hs(frame)
@@ -649,7 +731,9 @@ def extract_thumbnails(
     if face_net is not None:
         print(f"\n[4/5] Face detection on {len(candidates)} frames...")
         for i, c in enumerate(candidates):
-            c.face_score = face_score_from_count(detect_faces(face_net, c.frame))
+            n = detect_faces(face_net, c.frame)
+            c.face_count = n
+            c.face_score = face_score_from_count(n)
             if (i + 1) % 10 == 0 or i == len(candidates) - 1:
                 pct = (i + 1) / len(candidates) * 100
                 print(f"\r      {i + 1}/{len(candidates)}  ({pct:.0f}%)", end="", flush=True)
@@ -687,6 +771,7 @@ def extract_thumbnails(
                 "contrast":     round(item.contrast,     1),
                 "exposure":     round(item.exposure_score, 1),
                 "faces":        round(item.face_score,   1),
+                "face_count":   item.face_count,
                 "colorfulness": round(item.colorfulness, 1),
                 "saliency":     round(item.saliency,     1),
                 "stability":    round(item.stability_score, 1),
@@ -694,10 +779,11 @@ def extract_thumbnails(
         }
         results.append(result)
 
+        face_info = f"faces={item.face_count}" if not no_faces else "faces=N/A"
         print(
             f"  #{rank}  {fname}  score={item.score:.1f}  "
             f"sharp={item.sharpness:.0f}  sal={item.saliency:.0f}  "
-            f"stab={item.stability_score:.0f}  faces={item.face_score:.0f}  "
+            f"stab={item.stability_score:.0f}  {face_info}  "
             f"@ {mins:02d}:{secs:02d}"
         )
 
@@ -706,12 +792,13 @@ def extract_thumbnails(
     with open(report_path, "w", encoding="utf-8") as fh:
         json.dump(
             {
-                "video":                os.path.abspath(video_path),
-                "duration_sec":         round(duration, 2),
-                "thumbnails_count":     top_k,
-                "thumbnails_count_auto": top_k_auto,
-                "sample_interval_sec":  sample_interval,
-                "candidates_evaluated": len(candidates),
+                "video":                    os.path.abspath(video_path),
+                "duration_sec":             round(duration, 2),
+                "thumbnails_count":         top_k,
+                "thumbnails_count_auto":    top_k_auto,
+                "sample_interval_sec":      sample_interval,
+                "candidates_evaluated":     len(candidates),
+                "face_detection_enabled":   not no_faces,
                 "weights": {
                     "sharpness":    W_SHARPNESS,
                     "contrast":     W_CONTRAST,
@@ -732,7 +819,7 @@ def extract_thumbnails(
 
     # HTML preview
     html_path = os.path.join(output_dir, "preview.html")
-    write_html_preview(html_path, results)
+    write_html_preview(html_path, results, faces_disabled=no_faces)
 
     print(f"\nSaved: {os.path.abspath(output_dir)}/")
     print(f"  {len(selected)}x JPG  +  report.json  +  preview.html")
@@ -788,7 +875,7 @@ Optional dependencies:
         sys.exit(1)
 
     print("=" * 56)
-    print("  smart-thumbnailer  v2")
+    print("  smart-thumbnailer  v3")
     print("=" * 56)
 
     extract_thumbnails(
