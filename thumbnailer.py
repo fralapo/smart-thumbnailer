@@ -56,13 +56,17 @@ CAFFEMODEL_PATH = MODELS_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
 # ---------------------------------------------------------------------------
 # Scoring weights (must sum to 1.0)
 # ---------------------------------------------------------------------------
-W_SHARPNESS    = 0.30
-W_CONTRAST     = 0.15
+# Weights based on CQE (Panetta et al. IEEE TCE 2013) + video keyframe research.
+# Face is applied as a multiplier (FACE_BOOST) rather than an additive term —
+# this follows the YouTube patent approach and Song et al. 2016 (Yahoo Research).
+W_COLORFULNESS = 0.25  # CQE: highest perceptual impact
+W_SHARPNESS    = 0.20
+W_CONTRAST     = 0.15  # CQE: second
+W_NATURALNESS  = 0.10  # MSCN kurtosis — catches artifacts/compression
 W_EXPOSURE     = 0.12
-W_FACES        = 0.20
-W_COLORFULNESS = 0.08
 W_SALIENCY     = 0.10
-W_STABILITY    = 0.05
+W_STABILITY    = 0.08
+FACE_BOOST     = 1.30  # multiply score by this when face detected
 
 # Fast-filter thresholds
 MIN_BRIGHTNESS   = 22.0
@@ -109,19 +113,23 @@ class FrameCandidate:
     frame: np.ndarray
     # set during histogram phase
     hist: Optional[np.ndarray] = None
+    lab_hist: object = None          # list[np.ndarray] — Lab 3-channel, for zone diversity
     # raw metrics
     sharpness_raw:    float = 0.0
     contrast_raw:     float = 0.0
     exposure_score:   float = 0.0
     face_score:       float = 0.0
     face_count:       int   = 0
+    face_detected:    bool  = False
     colorfulness_raw: float = 0.0
+    naturalness_raw:  float = 0.0
     saliency_raw:     float = 0.0
     stability_score:  float = 100.0
     # normalized (0-100)
     sharpness:    float = 0.0
     contrast:     float = 0.0
     colorfulness: float = 0.0
+    naturalness:  float = 0.0
     saliency:     float = 0.0
     score:        float = 0.0
 
@@ -188,36 +196,158 @@ def spectral_residual_saliency(gray: np.ndarray) -> float:
     return float(sal_map.mean())
 
 
-def exposure_score(brightness: float) -> float:
-    """Score 0-100 based on closeness to ideal brightness [90, 170]."""
+def exposure_score(gray: np.ndarray) -> float:
+    """
+    Exposure score 0-100. Penalizes mean brightness far from ideal AND
+    frames with clipped highlights/shadows (blown whites, crushed blacks).
+    """
+    flat = gray.ravel().astype(np.float32)
+    brightness = float(flat.mean())
+
     lo, hi = 90.0, 170.0
     if lo <= brightness <= hi:
-        return 100.0
+        mean_score = 1.0
     elif brightness < lo:
-        return max(0.0, 100.0 * (brightness / lo))
+        mean_score = max(0.0, brightness / lo)
     else:
-        return max(0.0, 100.0 * (1.0 - (brightness - hi) / (255.0 - hi)))
+        mean_score = max(0.0, 1.0 - (brightness - hi) / (255.0 - hi))
+
+    pct_highlight = float(np.mean(flat > 245)) * 100.0
+    pct_shadow    = float(np.mean(flat < 10))  * 100.0
+    clip_penalty  = 1.0 - min(0.8, (pct_highlight + pct_shadow) / 15.0)
+
+    return float(mean_score * clip_penalty * 100.0)
 
 
-def face_score_from_count(n: int) -> float:
-    return [0.0, 70.0, 85.0, 100.0][min(n, 3)]
+def mscn_naturalness(gray: np.ndarray) -> float:
+    """
+    MSCN (Mean Subtracted Contrast Normalized) kurtosis naturalness score.
+    Natural scenes have MSCN kurtosis ~3-5. Very low (flat/uniform) or very
+    high (extreme noise/compression artifacts) both score poorly.
+    Returns [0, 1].
+    """
+    img = gray.astype(np.float64)
+    C = 1.0 / 255.0
+    mu = cv2.GaussianBlur(img, (7, 7), 7.0 / 6.0)
+    sigma = np.sqrt(np.abs(
+        cv2.GaussianBlur(img * img, (7, 7), 7.0 / 6.0) - mu * mu
+    ))
+    mscn = (img - mu) / (sigma + C)
+    flat = mscn.ravel()
+    std  = float(flat.std()) + 1e-8
+    kurt = float(np.mean(((flat - float(flat.mean())) / std) ** 4))
+    # Target sweet spot: 3 < kurtosis < 6
+    score = np.exp(-0.5 * ((np.log(max(kurt, 0.1)) - np.log(4.0)) / 0.8) ** 2)
+    return float(np.clip(score, 0.0, 1.0))
 
 
-def detect_faces(net: cv2.dnn.Net, bgr: np.ndarray, conf_thresh: float = 0.50) -> int:
+def colorfulness_combined(bgr: np.ndarray) -> float:
+    """
+    Combined colorfulness: Hasler & Susstrunk (2003) + HSV hue entropy +
+    saturation score. Catches grey/washed-out and oversaturated frames that
+    H&S alone misclassifies as high-quality.
+    """
+    B, G, R = cv2.split(bgr.astype("float32"))
+    rg = np.abs(R - G)
+    yb = np.abs(0.5 * (R + G) - B)
+    hs = float(
+        np.sqrt(np.std(rg) ** 2 + np.std(yb) ** 2)
+        + 0.3 * np.sqrt(np.mean(rg) ** 2 + np.mean(yb) ** 2)
+    )
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue, sat = hsv[:, :, 0], hsv[:, :, 1]
+    mask = sat > 30
+    if mask.sum() >= 100:
+        hue_vals = hue[mask]
+        hist_h, _ = np.histogram(hue_vals, bins=18, range=(0, 180))
+        hist_h = hist_h[hist_h > 0].astype(np.float32)
+        prob   = hist_h / hist_h.sum()
+        hue_entropy = float(-np.sum(prob * np.log2(prob + 1e-8))) / 4.17
+    else:
+        hue_entropy = 0.0
+
+    mean_sat  = float(sat.astype(np.float32).mean() / 255.0)
+    sat_score = float(np.exp(-0.5 * ((mean_sat - 0.45) / 0.20) ** 2))
+
+    return hs * (0.60 + 0.25 * hue_entropy + 0.15 * sat_score)
+
+
+def detect_faces(
+    net: cv2.dnn.Net, bgr: np.ndarray, conf_thresh: float = 0.70
+) -> List[tuple]:
+    """
+    Run res10 SSD face detector. Returns list of (x1,y1,x2,y2,conf) tuples.
+    conf_thresh=0.70 is recommended for video (0.5 gives too many false positives).
+    Mean (104,177,123) is the correct res10 training mean — not (104,117,123).
+    """
+    h, w = bgr.shape[:2]
     blob = cv2.dnn.blobFromImage(
         cv2.resize(bgr, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0)
     )
     net.setInput(blob)
-    detections = net.forward()
-    return min(sum(1 for i in range(detections.shape[2])
-                   if detections[0, 0, i, 2] > conf_thresh), 3)
+    dets = net.forward()
+    boxes = []
+    for i in range(dets.shape[2]):
+        conf = float(dets[0, 0, i, 2])
+        if conf < conf_thresh:
+            continue
+        x1 = int(dets[0, 0, i, 3] * w)
+        y1 = int(dets[0, 0, i, 4] * h)
+        x2 = int(dets[0, 0, i, 5] * w)
+        y2 = int(dets[0, 0, i, 6] * h)
+        if x2 > x1 and y2 > y1:
+            boxes.append((x1, y1, x2, y2, conf))
+    return boxes
+
+
+def face_area_position_score(detections: List[tuple], frame_h: int, frame_w: int) -> float:
+    """
+    Score face presence as [0..100] based on:
+    - Face area ratio (sweet spot 5-25% of frame — readable at thumbnail size)
+    - Vertical position (upper 60% preferred)
+    - Multiple faces penalised (crowded faces harder to read at thumb size)
+    Grounded in Google's actor-centric thumbnail patents (US9892324, US10242265).
+    """
+    if not detections:
+        return 0.0
+    frame_area = max(frame_h * frame_w, 1)
+    scores = []
+    for (x1, y1, x2, y2, conf) in detections:
+        area_ratio = (x2 - x1) * (y2 - y1) / frame_area
+        area_score = float(np.exp(
+            -0.5 * ((np.log(max(area_ratio, 1e-4)) - np.log(0.12)) / 0.9) ** 2
+        ))
+        face_cy = (y1 + y2) / 2.0
+        pos_score = 1.0 - 0.4 * (face_cy / frame_h)
+        scores.append(area_score * pos_score * min(conf, 1.0))
+    if not scores:
+        return 0.0
+    primary = max(scores)
+    multi_penalty = 1.0 / (1.0 + 0.15 * max(0, len(scores) - 1))
+    return float(primary * multi_penalty * 100.0)
 
 
 def compute_hist(gray: np.ndarray) -> np.ndarray:
-    """64-bin normalized grayscale histogram for stability/diversity checks."""
+    """64-bin normalized grayscale histogram for temporal stability checks."""
     hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
     cv2.normalize(hist, hist)
     return hist
+
+
+def compute_lab_hist(bgr: np.ndarray) -> List[np.ndarray]:
+    """
+    3-channel normalized histograms in Lab color space.
+    Used for zone-diversity check with Bhattacharyya distance.
+    Lab is perceptually calibrated — frames that look similar have low distance.
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    hists = []
+    for ch, bins in [(0, 32), (1, 16), (2, 16)]:
+        h = cv2.calcHist([lab], [ch], None, [bins], [0, 256])
+        cv2.normalize(h, h)
+        hists.append(h)
+    return hists
 
 
 def dhash(gray: np.ndarray, size: int = 8) -> int:
@@ -321,8 +451,9 @@ def deduplicate(candidates: List[FrameCandidate]) -> List[FrameCandidate]:
 
 def compute_stability_scores(candidates: List[FrameCandidate]) -> None:
     """
-    Assign a stability score based on histogram similarity to neighboring frames.
-    Transition frames (scene cuts) differ strongly from both neighbors and score low.
+    Pixel-level inter-frame stillness (Song et al. 2016, Yahoo Research).
+    Absdiff to neighbors detects motion/transition frames far better than
+    histogram correlation, which is a scene-change detector not a motion detector.
     """
     n = len(candidates)
     if n < 3:
@@ -331,12 +462,15 @@ def compute_stability_scores(candidates: List[FrameCandidate]) -> None:
         return
 
     for i, c in enumerate(candidates):
-        prev = candidates[max(0, i - 1)]
-        nxt  = candidates[min(n - 1, i + 1)]
-        corr_p = float(cv2.compareHist(c.hist, prev.hist, cv2.HISTCMP_CORREL))
-        corr_n = float(cv2.compareHist(c.hist, nxt.hist,  cv2.HISTCMP_CORREL))
-        # Penalize frames that look very different from BOTH neighbors
-        c.stability_score = max(0.0, min(corr_p, corr_n) * 100.0)
+        prev_gray = cv2.cvtColor(candidates[max(0, i - 1)].frame, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.cvtColor(c.frame, cv2.COLOR_BGR2GRAY)
+        next_gray = cv2.cvtColor(candidates[min(n - 1, i + 1)].frame, cv2.COLOR_BGR2GRAY)
+        diff_p = float(cv2.absdiff(curr_gray, prev_gray).mean())
+        diff_n = float(cv2.absdiff(curr_gray, next_gray).mean())
+        motion = (diff_p + diff_n) / 2.0
+        # stillness in [0, 1]: low motion = 1.0 (best), high motion = ~0
+        stillness = 1.0 / (1.0 + motion / 8.0)
+        c.stability_score = stillness * 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -351,36 +485,54 @@ def _normalize(values: List[float]) -> List[float]:
 
 
 def normalize_and_score(candidates: List[FrameCandidate]) -> None:
+    """
+    Normalize raw metrics to [0-100], compute composite score.
+    Face is applied as a multiplicative boost (FACE_BOOST) not additive weight —
+    following Song et al. 2016 and YouTube actor-centric thumbnail patents.
+    """
     if not candidates:
         return
 
     sharp_n  = _normalize([c.sharpness_raw    for c in candidates])
     cont_n   = _normalize([c.contrast_raw      for c in candidates])
     color_n  = _normalize([c.colorfulness_raw  for c in candidates])
+    nat_n    = _normalize([c.naturalness_raw   for c in candidates])
     sal_n    = _normalize([c.saliency_raw      for c in candidates])
 
-    for c, sn, cn, cfn, saln in zip(candidates, sharp_n, cont_n, color_n, sal_n):
+    for c, sn, cn, cfn, natn, saln in zip(
+        candidates, sharp_n, cont_n, color_n, nat_n, sal_n
+    ):
         c.sharpness    = sn
         c.contrast     = cn
         c.colorfulness = cfn
+        c.naturalness  = natn
         c.saliency     = saln
-        c.score = (
-            W_SHARPNESS    * c.sharpness
+        base = (
+            W_COLORFULNESS * c.colorfulness
+            + W_SHARPNESS    * c.sharpness
             + W_CONTRAST     * c.contrast
+            + W_NATURALNESS  * c.naturalness
             + W_EXPOSURE     * c.exposure_score
-            + W_FACES        * c.face_score
-            + W_COLORFULNESS * c.colorfulness
             + W_SALIENCY     * c.saliency
             + W_STABILITY    * c.stability_score
         )
+        c.score = base * (FACE_BOOST if c.face_detected else 1.0)
 
 
 # ---------------------------------------------------------------------------
 # Zone-based diversity selection
 # ---------------------------------------------------------------------------
 
-def _hist_corr(a: np.ndarray, b: np.ndarray) -> float:
-    return float(cv2.compareHist(a, b, cv2.HISTCMP_CORREL))
+def _lab_diversity(a_hists: List[np.ndarray], b_hists: List[np.ndarray]) -> float:
+    """
+    Mean Bhattacharyya distance across Lab channels.
+    Range [0, 1]: 0=identical, 1=maximally different.
+    Perceptually calibrated — visually similar frames cluster correctly.
+    """
+    return float(np.mean([
+        cv2.compareHist(a, b, cv2.HISTCMP_BHATTACHARYYA)
+        for a, b in zip(a_hists, b_hists)
+    ]))
 
 
 def select_zone_best(
@@ -417,9 +569,9 @@ def select_zone_best(
         for candidate in zone_sorted:
             if candidate.time_sec in used_times:
                 continue
-            # Check visual diversity vs already-selected frames
+            # Check visual diversity vs already-selected frames (Lab Bhattacharyya)
             if not selected or all(
-                1.0 - _hist_corr(candidate.hist, s.hist) >= min_visual_dist
+                _lab_diversity(candidate.lab_hist, s.lab_hist) >= min_visual_dist
                 for s in selected
             ):
                 chosen = candidate
@@ -491,14 +643,16 @@ def get_scene_sample_times(
 def write_html_preview(html_path: str, results: List[dict], faces_disabled: bool = False) -> None:
     """Self-contained HTML with base64-embedded thumbnails and metric bars."""
     METRIC_LABELS = {
+        "colorfulness": "Color",
         "sharpness":    "Sharp",
         "contrast":     "Contrast",
+        "naturalness":  "Natural",
         "exposure":     "Exposure",
-        "faces":        "Faces",
-        "colorfulness": "Color",
         "saliency":     "Saliency",
         "stability":    "Stability",
+        "faces":        "Faces",
     }
+    SKIP_IN_HTML = {"face_count", "face_boost"}
 
     cards = ""
     for r in results:
@@ -507,8 +661,8 @@ def write_html_preview(html_path: str, results: List[dict], faces_disabled: bool
 
         bars_html = []
         for k, v in r["metrics"].items():
-            if k == "face_count":
-                continue  # skip raw count; rendered via "faces" row
+            if k in SKIP_IN_HTML:
+                continue  # rendered via "faces" row or omitted
             label = METRIC_LABELS.get(k, k)
             if k == "faces":
                 if faces_disabled:
@@ -700,10 +854,12 @@ def extract_thumbnails(
         c = FrameCandidate(time_sec=t, frame=frame.copy())
         c.sharpness_raw    = tenengrad_sharpness(gray)
         c.contrast_raw     = float(gray.std())
-        c.exposure_score   = exposure_score(brightness)
-        c.colorfulness_raw = colorfulness_hs(frame)
+        c.exposure_score   = exposure_score(gray)
+        c.colorfulness_raw = colorfulness_combined(frame)
+        c.naturalness_raw  = mscn_naturalness(gray)
         c.saliency_raw     = spectral_residual_saliency(gray)
         c.hist             = compute_hist(gray)
+        c.lab_hist         = compute_lab_hist(frame)
         candidates.append(c)
 
     cap.release()
@@ -731,9 +887,10 @@ def extract_thumbnails(
     if face_net is not None:
         print(f"\n[4/5] Face detection on {len(candidates)} frames...")
         for i, c in enumerate(candidates):
-            n = detect_faces(face_net, c.frame)
-            c.face_count = n
-            c.face_score = face_score_from_count(n)
+            dets = detect_faces(face_net, c.frame)
+            c.face_count    = len(dets)
+            c.face_detected = len(dets) > 0
+            c.face_score    = face_area_position_score(dets, c.frame.shape[0], c.frame.shape[1])
             if (i + 1) % 10 == 0 or i == len(candidates) - 1:
                 pct = (i + 1) / len(candidates) * 100
                 print(f"\r      {i + 1}/{len(candidates)}  ({pct:.0f}%)", end="", flush=True)
@@ -767,14 +924,16 @@ def extract_thumbnails(
             "timestamp": f"{mins:02d}:{secs:02d}",
             "score":    round(item.score, 2),
             "metrics": {
+                "colorfulness": round(item.colorfulness, 1),
                 "sharpness":    round(item.sharpness,    1),
                 "contrast":     round(item.contrast,     1),
+                "naturalness":  round(item.naturalness,  1),
                 "exposure":     round(item.exposure_score, 1),
-                "faces":        round(item.face_score,   1),
-                "face_count":   item.face_count,
-                "colorfulness": round(item.colorfulness, 1),
                 "saliency":     round(item.saliency,     1),
                 "stability":    round(item.stability_score, 1),
+                "faces":        round(item.face_score,   1),
+                "face_count":   item.face_count,
+                "face_boost":   FACE_BOOST if item.face_detected else 1.0,
             },
         }
         results.append(result)
@@ -800,13 +959,14 @@ def extract_thumbnails(
                 "candidates_evaluated":     len(candidates),
                 "face_detection_enabled":   not no_faces,
                 "weights": {
+                    "colorfulness": W_COLORFULNESS,
                     "sharpness":    W_SHARPNESS,
                     "contrast":     W_CONTRAST,
+                    "naturalness":  W_NATURALNESS,
                     "exposure":     W_EXPOSURE,
-                    "faces":        W_FACES,
-                    "colorfulness": W_COLORFULNESS,
                     "saliency":     W_SALIENCY,
                     "stability":    W_STABILITY,
+                    "face_boost":   FACE_BOOST,
                 },
                 "thumbnails": [
                     {k: v for k, v in r.items() if not k.startswith("_")}
@@ -875,7 +1035,7 @@ Optional dependencies:
         sys.exit(1)
 
     print("=" * 56)
-    print("  smart-thumbnailer  v3")
+    print("  smart-thumbnailer  v4")
     print("=" * 56)
 
     extract_thumbnails(
