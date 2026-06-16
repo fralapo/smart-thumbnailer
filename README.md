@@ -3,7 +3,7 @@
 <h1 align="center">smart-thumbnailer</h1>
 
 <p align="center">
-  Extract the best thumbnail frames from a video — no cloud, no ML runtime, just OpenCV and NumPy.
+  Extract the best thumbnail frames from a video. No cloud, no ML runtime, just OpenCV and NumPy.
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 
 ---
 
-Naive keyframe extraction tends to dump six nearly identical frames from the same shot. `smart-thumbnailer` scores every candidate on colorfulness, sharpness, saliency, and face area, then picks one winner per time zone — so the output actually covers the full video instead of one lucky second.
+Naive keyframe extraction tends to dump six nearly identical frames from the same shot. `smart-thumbnailer` scores every candidate on colorfulness, sharpness, saliency, and face area, then picks one winner per time zone, so the output actually covers the full video instead of one lucky second.
 
 The face detector (~2 MB) downloads itself on the first run. It runs without a GPU, PyTorch, or any cloud API.
 
@@ -167,8 +167,8 @@ video
                  │   colorfulness   (Hasler & Süsstrunk 2003 + HSV hue entropy)
                  │   sharpness      (Tenengrad, center-weighted Sobel gradient)
                  │   contrast       (RMS)
-                 │   naturalness    (MSCN kurtosis — catches compression artifacts)
-                 │   exposure       (clipping-aware — penalises blown highlights)
+                 │   naturalness    (MSCN kurtosis, catches compression artifacts)
+                 │   exposure       (clipping-aware, penalises blown highlights)
                  │   saliency       (spectral residual, Hou & Zhang CVPR 2007)
                  │   stability      (pixel absdiff to temporal neighbors)
                  │   faces          (res10 SSD, conf ≥ 0.70, scored by area + position)
@@ -204,7 +204,7 @@ Colorfulness is the highest-weighted metric, which is counterintuitive, but that
 - Python 3.9+
 - `opencv-python >= 4.5`
 - `numpy >= 1.20`
-- `scenedetect[opencv]` — optional, for scene-aware sampling
+- `scenedetect[opencv]` (optional, for scene-aware sampling)
 
 ## License
 
