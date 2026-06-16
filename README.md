@@ -55,15 +55,16 @@ The res10 face detection model (~2 MB) downloads on first use.
 python thumbnailer.py video.mp4
 ```
 
-Output lands in `thumbnails/`:
+Output lands in `thumbnails/video/`:
 
 ```
 thumbnails/
-├── thumb_1_04m25s.jpg
-├── thumb_2_07m15s.jpg
-├── ...
-├── report.json
-└── preview.html
+└── video/
+    ├── thumb_1_04m25s.jpg
+    ├── thumb_2_07m15s.jpg
+    ├── ...
+    ├── report.json
+    └── preview.html
 ```
 
 Open `preview.html` in a browser to compare all candidates side by side with metric bars.
@@ -71,12 +72,12 @@ Open `preview.html` in a browser to compare all candidates side by side with met
 ## Usage
 
 ```
-python thumbnailer.py VIDEO [options]
+python thumbnailer.py [inputs...] [options]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `-o, --output` | `thumbnails/` | Output directory |
+| `-o, --output` | `thumbnails/` | Output root directory |
 | `-k, --top-k` | auto | Thumbnail count (overrides auto-scale) |
 | `-s, --sample-interval` | `5.0` | Seconds between uniform samples |
 | `--skip-pct` | `0.05` | Skip this fraction at the start and end |
@@ -84,7 +85,7 @@ python thumbnailer.py VIDEO [options]
 | `--no-faces` | off | Skip face detection (faster) |
 | `--no-scene-detect` | off | Skip PySceneDetect |
 
-### Examples
+### Single file
 
 ```bash
 # Auto count (13-min video → 6 thumbnails)
@@ -98,6 +99,47 @@ python thumbnailer.py talk.mp4 --no-faces --no-scene-detect
 
 # Sample more densely (every 2 s instead of 5 s)
 python thumbnailer.py talk.mp4 -s 2
+```
+
+### Batch processing
+
+```bash
+# All videos in the same directory as the script
+python thumbnailer.py
+
+# All videos inside a specific folder
+python thumbnailer.py /path/to/videos/
+
+# All .mp4 files in the script directory
+python thumbnailer.py .mp4
+
+# All .mp4 and .mkv in a specific folder
+python thumbnailer.py /path/to/videos/ .mp4 .mkv
+
+# Multiple explicit files
+python thumbnailer.py clip1.mp4 clip2.mkv interview.mov
+```
+
+Each video gets its own subfolder under `thumbnails/`:
+
+```
+thumbnails/
+├── clip1/
+│   ├── thumb_1_01m05s.jpg
+│   ├── report.json
+│   └── preview.html
+├── clip2/
+│   └── ...
+└── interview/
+    └── ...
+```
+
+When processing multiple files, a summary prints at the end:
+
+```
+========================================================
+  Done: 3/3 succeeded
+========================================================
 ```
 
 ## Auto thumbnail count

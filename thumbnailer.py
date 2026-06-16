@@ -76,6 +76,11 @@ MIN_SHARPNESS_RAW = 15.0
 # dHash near-duplicate threshold (out of 64 bits)
 DHASH_MAX_HAMMING = 12
 
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
+    ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts",
+}
+
 
 # ---------------------------------------------------------------------------
 # Auto top-k: number of thumbnails based on video duration
@@ -991,24 +996,89 @@ def extract_thumbnails(
 # CLI
 # ---------------------------------------------------------------------------
 
+def resolve_input_videos(inputs: List[str]) -> List[str]:
+    """
+    Resolve positional CLI args to an ordered list of video file paths.
+
+    Supported forms (can be mixed):
+      (none)            -> all videos in the script's directory
+      video.mp4         -> single explicit file
+      /path/to/dir/     -> all videos inside that directory
+      .mp4              -> all .mp4 in script's directory
+      /path/dir .mp4    -> all .mp4 in specified directory
+    """
+    script_dir = Path(__file__).parent
+
+    ext_filters: set = set()
+    scan_dirs: List[Path] = []
+    video_files: List[str] = []
+    seen: set = set()
+
+    for token in inputs:
+        # Extension shorthand: starts with "." and has no path separator
+        if (token.startswith(".") and len(token) > 1
+                and "/" not in token and "\\" not in token):
+            ext_filters.add(token.lower())
+            continue
+
+        p = Path(token)
+        if p.is_dir():
+            scan_dirs.append(p)
+        elif p.is_file():
+            resolved = str(p.resolve())
+            if p.suffix.lower() in VIDEO_EXTENSIONS:
+                if resolved not in seen:
+                    video_files.append(resolved)
+                    seen.add(resolved)
+            else:
+                print(f"Warning: {token!r} skipped -- not a known video format",
+                      file=sys.stderr)
+        else:
+            print(f"Warning: {token!r} not found", file=sys.stderr)
+
+    # Scan dirs when: no input at all, or extension filter given without explicit dir
+    need_scan = (not inputs) or bool(ext_filters) or bool(scan_dirs)
+    if need_scan and not scan_dirs:
+        scan_dirs = [script_dir]
+
+    exts = ext_filters if ext_filters else VIDEO_EXTENSIONS
+    for d in scan_dirs:
+        for f in sorted(d.iterdir()):
+            if f.is_file() and f.suffix.lower() in exts:
+                resolved = str(f.resolve())
+                if resolved not in seen:
+                    video_files.append(resolved)
+                    seen.add(resolved)
+
+    return video_files
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract optimal thumbnail frames from a video.",
+        description="Extract optimal thumbnail frames from video files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python thumbnailer.py talk.mp4
-  python thumbnailer.py talk.mp4 -o out/ -k 5
-  python thumbnailer.py talk.mp4 -s 3 --no-faces
-  python thumbnailer.py talk.mp4 --no-scene-detect
+Input modes:
+  python thumbnailer.py                          all videos in script directory
+  python thumbnailer.py video.mp4                single file
+  python thumbnailer.py video1.mp4 video2.mkv    multiple explicit files
+  python thumbnailer.py /path/to/dir/            all videos in directory
+  python thumbnailer.py .mp4                     all .mp4 in script directory
+  python thumbnailer.py /path/dir .mp4 .mkv      filtered by extension
+
+Output:
+  thumbnails/<video_name>/thumb_N_MMmSSs.jpg
+  thumbnails/<video_name>/report.json
+  thumbnails/<video_name>/preview.html
 
 Optional dependencies:
   pip install scenedetect[opencv]   # enables scene-aware sampling
         """,
     )
-    parser.add_argument("video", help="Path to video file")
-    parser.add_argument("-o", "--output",          default="thumbnails",
-                        help="Output directory (default: thumbnails/)")
+    parser.add_argument("inputs", nargs="*",
+                        help="Video files, directories, or extension filters (.mp4)")
+    parser.add_argument("-o", "--output",          default=None,
+                        help="Output root directory (default: thumbnails/)")
     parser.add_argument("-k", "--top-k",           type=int,   default=None,
                         help="Number of thumbnails to extract (default: auto from duration)")
     parser.add_argument("-s", "--sample-interval", type=float, default=5.0,
@@ -1024,9 +1094,6 @@ Optional dependencies:
 
     args = parser.parse_args()
 
-    if not os.path.isfile(args.video):
-        print(f"Error: file not found: {args.video}", file=sys.stderr)
-        sys.exit(1)
     if args.top_k is not None and args.top_k < 1:
         print("Error: --top-k must be >= 1", file=sys.stderr)
         sys.exit(1)
@@ -1034,20 +1101,57 @@ Optional dependencies:
         print("Error: --sample-interval must be >= 0.5", file=sys.stderr)
         sys.exit(1)
 
+    videos = resolve_input_videos(args.inputs)
+
+    if not videos:
+        print("Error: no video files found.", file=sys.stderr)
+        sys.exit(1)
+
+    output_root = args.output or "thumbnails"
+    batch = len(videos) > 1
+
     print("=" * 56)
     print("  smart-thumbnailer  v4")
     print("=" * 56)
+    if batch:
+        print(f"Batch mode: {len(videos)} video(s) queued\n")
 
-    extract_thumbnails(
-        video_path       = args.video,
-        output_dir       = args.output,
-        top_k            = args.top_k,
-        sample_interval  = args.sample_interval,
-        no_faces         = args.no_faces,
-        no_scene_detect  = args.no_scene_detect,
-        skip_pct         = args.skip_pct,
-        jpeg_quality     = args.jpeg_quality,
-    )
+    ok = 0
+    failed: List[str] = []
+
+    for i, video_path in enumerate(videos, 1):
+        stem = Path(video_path).stem
+        safe_stem = "".join(c if c not in '<>:"/\\|?*' else "_" for c in stem)
+
+        if batch:
+            out_dir = os.path.join(output_root, safe_stem)
+            print(f"[{i}/{len(videos)}] {os.path.basename(video_path)}")
+        else:
+            # Single file: honour -o as direct path for backward compat
+            out_dir = args.output if args.output else os.path.join(output_root, safe_stem)
+
+        try:
+            extract_thumbnails(
+                video_path      = video_path,
+                output_dir      = out_dir,
+                top_k           = args.top_k,
+                sample_interval = args.sample_interval,
+                no_faces        = args.no_faces,
+                no_scene_detect = args.no_scene_detect,
+                skip_pct        = args.skip_pct,
+                jpeg_quality    = args.jpeg_quality,
+            )
+            ok += 1
+        except Exception as exc:
+            print(f"  Error: {exc}", file=sys.stderr)
+            failed.append(os.path.basename(video_path))
+
+    if batch:
+        print(f"\n{'=' * 56}")
+        print(f"  Done: {ok}/{len(videos)} succeeded")
+        if failed:
+            print(f"  Failed ({len(failed)}): {', '.join(failed)}")
+        print("=" * 56)
 
 
 if __name__ == "__main__":
