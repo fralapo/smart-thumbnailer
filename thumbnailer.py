@@ -52,7 +52,7 @@ W_COLORFULNESS = 0.10
 # Fast-filter thresholds (applied before full scoring)
 MIN_BRIGHTNESS = 22.0
 MAX_BRIGHTNESS = 233.0
-MIN_SHARPNESS_RAW = 15.0   # Laplacian variance below this → blurry
+MIN_SHARPNESS_RAW = 15.0   # Laplacian variance below this -> blurry
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ def exposure_score(brightness: float) -> float:
 
 
 def face_score_from_count(n: int) -> float:
-    """Non-linear mapping: 0→0, 1→70, 2→85, 3+→100."""
+    """Non-linear mapping: 0->0, 1->70, 2->85, 3+->100."""
     return [0.0, 70.0, 85.0, 100.0][min(n, 3)]
 
 
@@ -369,7 +369,7 @@ def extract_thumbnails(
     mins_total, secs_total = divmod(int(duration), 60)
     print(f"Video    : {os.path.basename(video_path)}")
     print(f"Duration : {mins_total}m{secs_total:02d}s  |  FPS: {fps:.2f}  |  Frames: {total_frames}")
-    print(f"Sampling : every {sample_interval}s → ~{expected_samples} candidates")
+    print(f"Sampling : every {sample_interval}s ->~{expected_samples} candidates")
     print(f"Skip     : first {skip_start:.0f}s + last {duration - skip_end:.0f}s")
 
     # ── Phase 1: Load face detector ─────────────────────────────────────────
@@ -378,7 +378,7 @@ def extract_thumbnails(
         print("\n[1/4] Loading face detector...")
         face_net = load_face_detector()
         if face_net is None:
-            print("      → face detection disabled (model unavailable)")
+            print("      ->face detection disabled (model unavailable)")
 
     # ── Phase 2: Coarse sampling + fast filter ───────────────────────────────
     print("\n[2/4] Sampling frames...")
@@ -415,7 +415,7 @@ def extract_thumbnails(
         t += sample_interval
 
     cap.release()
-    print(f"      → {len(candidates)} candidates pass fast filter")
+    print(f"      ->{len(candidates)} candidates pass fast filter")
 
     if not candidates:
         raise RuntimeError(
