@@ -74,6 +74,33 @@ DHASH_MAX_HAMMING = 12
 
 
 # ---------------------------------------------------------------------------
+# Auto top-k: number of thumbnails based on video duration
+# ---------------------------------------------------------------------------
+
+def auto_top_k(duration_sec: float) -> int:
+    """
+    Choose how many thumbnails to extract based on video length.
+
+    Scale:
+      < 3 min  -> 1
+      3-8 min  -> 2
+      8-20 min -> 3
+      20-40    -> 4
+      40-70    -> 5
+      70-120   -> 6
+      > 120    -> 7  (capped at 10)
+    """
+    m = duration_sec / 60.0
+    if m < 3:   return 1
+    if m < 8:   return 2
+    if m < 20:  return 3
+    if m < 40:  return 4
+    if m < 70:  return 5
+    if m < 120: return 6
+    return min(7 + int((m - 120) / 30), 10)
+
+
+# ---------------------------------------------------------------------------
 # Data type
 # ---------------------------------------------------------------------------
 @dataclass
@@ -484,7 +511,7 @@ def write_html_preview(html_path: str, results: List[dict]) -> None:
 def extract_thumbnails(
     video_path: str,
     output_dir: str = "thumbnails",
-    top_k: int = 3,
+    top_k: Optional[int] = None,
     sample_interval: float = 5.0,
     no_faces: bool = False,
     no_scene_detect: bool = False,
@@ -497,7 +524,7 @@ def extract_thumbnails(
     Args:
         video_path:       Path to input video.
         output_dir:       Directory for output files.
-        top_k:            Number of thumbnails to extract.
+        top_k:            Number of thumbnails (None = auto from duration).
         sample_interval:  Seconds between uniformly sampled frames.
         no_faces:         Skip face detection.
         no_scene_detect:  Skip PySceneDetect (if available).
@@ -522,9 +549,18 @@ def extract_thumbnails(
     mins_t, secs_t = divmod(int(duration), 60)
     n_uniform = int((skip_end - skip_start) / sample_interval)
 
+    # Resolve top_k: auto if not specified
+    top_k_auto = top_k is None
+    if top_k is None:
+        top_k = auto_top_k(duration)
+
     print(f"Video    : {os.path.basename(video_path)}")
     print(f"Duration : {mins_t}m{secs_t:02d}s  |  FPS: {fps:.2f}  |  Frames: {total_frames}")
     print(f"Skip     : first {skip_start:.0f}s + last {duration - skip_end:.0f}s")
+    if top_k_auto:
+        print(f"Thumbs   : {top_k}  (auto, {mins_t}m video)")
+    else:
+        print(f"Thumbs   : {top_k}  (manual)")
 
     # ── Phase 1: Collect candidate times ────────────────────────────────────
     uniform_times = [
@@ -672,6 +708,8 @@ def extract_thumbnails(
             {
                 "video":                os.path.abspath(video_path),
                 "duration_sec":         round(duration, 2),
+                "thumbnails_count":     top_k,
+                "thumbnails_count_auto": top_k_auto,
                 "sample_interval_sec":  sample_interval,
                 "candidates_evaluated": len(candidates),
                 "weights": {
@@ -724,8 +762,8 @@ Optional dependencies:
     parser.add_argument("video", help="Path to video file")
     parser.add_argument("-o", "--output",          default="thumbnails",
                         help="Output directory (default: thumbnails/)")
-    parser.add_argument("-k", "--top-k",           type=int,   default=3,
-                        help="Number of thumbnails to extract (default: 3)")
+    parser.add_argument("-k", "--top-k",           type=int,   default=None,
+                        help="Number of thumbnails to extract (default: auto from duration)")
     parser.add_argument("-s", "--sample-interval", type=float, default=5.0,
                         help="Seconds between sampled frames (default: 5.0)")
     parser.add_argument("--skip-pct",              type=float, default=0.05,
@@ -742,7 +780,7 @@ Optional dependencies:
     if not os.path.isfile(args.video):
         print(f"Error: file not found: {args.video}", file=sys.stderr)
         sys.exit(1)
-    if args.top_k < 1:
+    if args.top_k is not None and args.top_k < 1:
         print("Error: --top-k must be >= 1", file=sys.stderr)
         sys.exit(1)
     if args.sample_interval < 0.5:
