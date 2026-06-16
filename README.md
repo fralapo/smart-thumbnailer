@@ -47,7 +47,7 @@ git clone https://github.com/fralapo/smart-thumbnailer.git
 cd smart-thumbnailer
 ```
 
-The res10 face detection model (~2 MB) downloads on first use.
+The res10 face detection model (~2 MB) downloads on first use with a 60 s timeout. If the download is interrupted, no partial file is left behind — the next run retries cleanly.
 
 ## Quick start
 
@@ -80,7 +80,7 @@ python thumbnailer.py [inputs...] [options]
 | `-o, --output` | `thumbnails/` | Output root directory |
 | `-k, --top-k` | auto | Thumbnail count (overrides auto-scale) |
 | `-s, --sample-interval` | `5.0` | Seconds between uniform samples |
-| `--skip-pct` | `0.05` | Skip this fraction at the start and end |
+| `--skip-pct` | `0.05` | Skip this fraction at the start and end (0.0–0.45) |
 | `--jpeg-quality` | `95` | JPEG quality (1–100) |
 | `--no-faces` | off | Skip face detection (faster) |
 | `--no-scene-detect` | off | Skip PySceneDetect |
