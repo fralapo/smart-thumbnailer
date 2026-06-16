@@ -18,7 +18,9 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import sys
+import unicodedata
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -373,20 +375,32 @@ def hamming_dist(h1: int, h2: int) -> int:
 # Model download / load
 # ---------------------------------------------------------------------------
 
+def _download_file(url: str, dest: Path, label: str, timeout: int = 60) -> None:
+    """Download url to dest atomically (temp file + rename) with a timeout."""
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    print(f"  Downloading {label}...", end=" ", flush=True)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            with open(tmp, "wb") as fh:
+                shutil.copyfileobj(resp, fh)
+        tmp.rename(dest)
+        print("done")
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
 def download_models() -> bool:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     try:
         if not PROTOTXT_PATH.exists():
-            print("  Downloading deploy.prototxt...", end=" ", flush=True)
-            urllib.request.urlretrieve(PROTOTXT_URL, PROTOTXT_PATH)
-            print("done")
+            _download_file(PROTOTXT_URL, PROTOTXT_PATH, "deploy.prototxt")
         if not CAFFEMODEL_PATH.exists():
-            print("  Downloading res10 caffemodel (~2MB)...", end=" ", flush=True)
-            urllib.request.urlretrieve(CAFFEMODEL_URL, CAFFEMODEL_PATH)
-            print("done")
+            _download_file(CAFFEMODEL_URL, CAFFEMODEL_PATH, "res10 caffemodel (~2MB)")
         return True
     except Exception as e:
-        print(f"failed ({e})")
+        print(f"failed ({e})", file=sys.stderr)
         return False
 
 
@@ -780,6 +794,7 @@ def extract_thumbnails(
     rotation     = get_video_rotation(cap)
 
     if duration < 1.0:
+        cap.release()
         raise RuntimeError("Video too short or unreadable.")
 
     skip_start = duration * skip_pct
@@ -841,33 +856,35 @@ def extract_thumbnails(
     print(f"\n[3/5] Sampling {len(merged_times)} frames...")
     candidates: List[FrameCandidate] = []
 
-    for idx, t in enumerate(merged_times):
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
-        ok, frame = cap.read()
-        if not ok:
-            continue
+    try:
+        for idx, t in enumerate(merged_times):
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+            ok, frame = cap.read()
+            if not ok:
+                continue
 
-        frame      = apply_rotation(frame, rotation)
-        gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        brightness = float(gray.mean())
+            frame      = apply_rotation(frame, rotation)
+            gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness = float(gray.mean())
 
-        if brightness < MIN_BRIGHTNESS or brightness > MAX_BRIGHTNESS:
-            continue
-        if laplacian_sharpness(gray) < MIN_SHARPNESS_RAW:
-            continue
+            if brightness < MIN_BRIGHTNESS or brightness > MAX_BRIGHTNESS:
+                continue
+            if laplacian_sharpness(gray) < MIN_SHARPNESS_RAW:
+                continue
 
-        c = FrameCandidate(time_sec=t, frame=frame.copy())
-        c.sharpness_raw    = tenengrad_sharpness(gray)
-        c.contrast_raw     = float(gray.std())
-        c.exposure_score   = exposure_score(gray)
-        c.colorfulness_raw = colorfulness_combined(frame)
-        c.naturalness_raw  = mscn_naturalness(gray)
-        c.saliency_raw     = spectral_residual_saliency(gray)
-        c.hist             = compute_hist(gray)
-        c.lab_hist         = compute_lab_hist(frame)
-        candidates.append(c)
+            c = FrameCandidate(time_sec=t, frame=frame.copy())
+            c.sharpness_raw    = tenengrad_sharpness(gray)
+            c.contrast_raw     = float(gray.std())
+            c.exposure_score   = exposure_score(gray)
+            c.colorfulness_raw = colorfulness_combined(frame)
+            c.naturalness_raw  = mscn_naturalness(gray)
+            c.saliency_raw     = spectral_residual_saliency(gray)
+            c.hist             = compute_hist(gray)
+            c.lab_hist         = compute_lab_hist(frame)
+            candidates.append(c)
+    finally:
+        cap.release()
 
-    cap.release()
     print(f"      {len(candidates)} candidates pass fast filter")
 
     if not candidates:
@@ -919,7 +936,8 @@ def extract_thumbnails(
         mins, secs = divmod(int(item.time_sec), 60)
         fname    = f"thumb_{rank}_{mins:02d}m{secs:02d}s.jpg"
         abs_path = os.path.join(output_dir, fname)
-        cv2.imwrite(abs_path, item.frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        if not cv2.imwrite(abs_path, item.frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]):
+            raise RuntimeError(f"Failed to write {abs_path} — disk full or permission error?")
 
         result = {
             "rank":     rank,
@@ -995,6 +1013,32 @@ def extract_thumbnails(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+
+def _safe_stem(stem: str) -> str:
+    """
+    Sanitize a video filename stem for use as an output directory name.
+    Handles Windows-illegal characters, control characters, reserved names,
+    and edge cases like all-dots or all-spaces.
+    """
+    # Strip Unicode control characters
+    stem = "".join(c for c in stem if not unicodedata.category(c).startswith("C"))
+    # Replace Windows-illegal path characters
+    stem = "".join(c if c not in r'<>:"/\|?*' else "_" for c in stem)
+    # Strip leading/trailing dots and spaces (Windows treats them as nothing)
+    stem = stem.strip(". ")
+    # Handle Windows reserved device names (case-insensitive, with or without extension)
+    base = stem.split(".")[0].upper()
+    if base in _WINDOWS_RESERVED:
+        stem = "_" + stem
+    return stem or "_video"
+
 
 def resolve_input_videos(inputs: List[str]) -> List[str]:
     """
@@ -1100,6 +1144,12 @@ Optional dependencies:
     if args.sample_interval < 0.5:
         print("Error: --sample-interval must be >= 0.5", file=sys.stderr)
         sys.exit(1)
+    if not (1 <= args.jpeg_quality <= 100):
+        print("Error: --jpeg-quality must be 1-100", file=sys.stderr)
+        sys.exit(1)
+    if not (0.0 <= args.skip_pct < 0.45):
+        print("Error: --skip-pct must be in [0.0, 0.45)", file=sys.stderr)
+        sys.exit(1)
 
     videos = resolve_input_videos(args.inputs)
 
@@ -1121,7 +1171,7 @@ Optional dependencies:
 
     for i, video_path in enumerate(videos, 1):
         stem = Path(video_path).stem
-        safe_stem = "".join(c if c not in '<>:"/\\|?*' else "_" for c in stem)
+        safe_stem = _safe_stem(stem)
 
         if batch:
             out_dir = os.path.join(output_root, safe_stem)
