@@ -16,7 +16,7 @@
 
 Naive keyframe extraction tends to dump six nearly identical frames from the same shot. `smart-thumbnailer` scores every candidate on colorfulness, sharpness, saliency, and face area, then picks one winner per time zone — so the output actually covers the full video instead of one lucky second.
 
-The face detector (~2 MB) downloads itself on the first run. No GPU, no PyTorch, no cloud API.
+The face detector (~2 MB) downloads itself on the first run. It runs without a GPU, PyTorch, or any cloud API.
 
 ## Features
 
@@ -47,7 +47,7 @@ git clone https://github.com/fralapo/smart-thumbnailer.git
 cd smart-thumbnailer
 ```
 
-The res10 face detection model (~2 MB) downloads on first use with a 60 s timeout. If the download is interrupted, no partial file is left behind — the next run retries cleanly.
+The res10 face detection model (~2 MB) downloads on first use with a 60 s timeout. If the download is interrupted, it cleans up and retries on the next run.
 
 ## Quick start
 
@@ -134,7 +134,7 @@ thumbnails/
     └── ...
 ```
 
-When processing multiple files, a summary prints at the end:
+Batch runs print a summary at the end:
 
 ```
 ========================================================
@@ -176,7 +176,7 @@ video
                       └─ output: N × JPG  +  report.json  +  preview.html
 ```
 
-Faces apply as a score multiplier (×1.30) rather than an additive weight. A frame with a readable face in the upper half of the shot will always beat a comparable faceless frame, regardless of other scores. This follows how YouTube's own patents treat face detection.
+Faces apply as a score multiplier (×1.30) rather than an additive weight. A frame with a readable face in the upper half of the shot will always beat a comparable faceless frame. YouTube's own patents (US9892324, US10242265) use the same approach.
 
 Scoring weights (all tunable in `thumbnailer.py`):
 
@@ -191,7 +191,7 @@ Scoring weights (all tunable in `thumbnailer.py`):
 | Stability | 8% |
 | Face | ×1.30 boost |
 
-Colorfulness is the highest-weighted metric — counterintuitive, but that is what the CQE study (Panetta et al., IEEE TCE 2013) found when correlating image quality metrics with human judgments.
+Colorfulness is the highest-weighted metric, which is counterintuitive, but that's what the CQE study (Panetta et al., IEEE TCE 2013) found when correlating image quality metrics with human judgments.
 
 ## Output files
 

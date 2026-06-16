@@ -1161,7 +1161,7 @@ Optional dependencies:
     batch = len(videos) > 1
 
     print("=" * 56)
-    print("  smart-thumbnailer  v4")
+    print("  smart-thumbnailer")
     print("=" * 56)
     if batch:
         print(f"Batch mode: {len(videos)} video(s) queued\n")
