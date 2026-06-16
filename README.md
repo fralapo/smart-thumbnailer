@@ -20,8 +20,8 @@ The face detector (~2 MB) downloads itself on the first run. No GPU, no PyTorch,
 
 ## Features
 
-- Zone-based diversity: splits the timeline into N equal zones, picks the top scorer from each
-- Multi-metric scoring: colorfulness, Tenengrad sharpness, MSCN naturalness, saliency, face area and position
+- Zone-based diversity: splits the timeline into N equal zones, picks the top scorer from each; diversity check uses Lab Bhattacharyya distance so selected frames are perceptually distinct
+- Multi-metric scoring: colorfulness (highest weight), Tenengrad sharpness, RMS contrast, MSCN naturalness, clipping-aware exposure, spectral residual saliency, pixel-level stability, face area and position
 - dHash deduplication before full scoring (Hamming distance ≤ 12/64 bits)
 - Auto thumbnail count that scales with video duration (2 for short clips, up to 10 for feature-length)
 - PySceneDetect integration merges detected cut points with uniform samples when installed
@@ -130,7 +130,7 @@ video
                  │   saliency       (spectral residual, Hou & Zhang CVPR 2007)
                  │   stability      (pixel absdiff to temporal neighbors)
                  │   faces          (res10 SSD, conf ≥ 0.70, scored by area + position)
-                 └─ zone selection: divide usable span into K zones, pick top per zone
+                 └─ zone selection: K zones, top scorer per zone (Lab Bhattacharyya diversity check)
                       └─ output: N × JPG  +  report.json  +  preview.html
 ```
 
