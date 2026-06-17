@@ -711,6 +711,7 @@ def write_html_preview(html_path: str, results: List[dict], faces_disabled: bool
                     f'<span class="mv">{v:.0f}</span></div>'
                 )
         bars = "".join(bars_html)
+        filename = os.path.basename(r["_abs_path"])
         cards += f"""
 <div class="card">
   <img src="data:image/jpeg;base64,{b64}" alt="#{r['rank']}">
@@ -720,6 +721,7 @@ def write_html_preview(html_path: str, results: List[dict], faces_disabled: bool
       <span class="ts">{r['timestamp']}</span>
       <span class="sc">Score {r['score']:.1f}</span>
     </div>
+    <div class="fn">{filename}</div>
     <div class="metrics">{bars}</div>
   </div>
 </div>"""
@@ -741,6 +743,7 @@ def write_html_preview(html_path: str, results: List[dict], faces_disabled: bool
   .rank{{font-size:1rem;font-weight:700;color:#fff}}
   .ts{{font-size:.8rem;color:#777}}
   .sc{{margin-left:auto;font-size:.85rem;color:#5bf;font-weight:600}}
+  .fn{{font-size:.75rem;color:#888;margin-bottom:8px;word-break:break-all}}
   .metrics{{display:flex;flex-direction:column;gap:4px}}
   .m{{display:flex;align-items:center;gap:7px;font-size:.75rem}}
   .ml{{width:58px;color:#666;flex-shrink:0}}
