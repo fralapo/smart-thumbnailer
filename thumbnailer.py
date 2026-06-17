@@ -93,22 +93,22 @@ def auto_top_k(duration_sec: float) -> int:
     Choose how many thumbnails to extract based on video length.
 
     Scale:
-      < 3 min  -> 2
-      3-8 min  -> 4
-      8-20 min -> 6
-      20-40    -> 8
-      40-70    -> 9
-      70-120   -> 10
-      > 120    -> 10 (capped)
+      < 3 min  -> 5
+      3-8 min  -> 7
+      8-20 min -> 9
+      20-40    -> 11
+      40-70    -> 12
+      70-120   -> 13
+      > 120    -> 13 (capped)
     """
     m = duration_sec / 60.0
-    if m < 3:   return 2
-    if m < 8:   return 4
-    if m < 20:  return 6
-    if m < 40:  return 8
-    if m < 70:  return 9
-    if m < 120: return 10
-    return 10
+    if m < 3:   return 5
+    if m < 8:   return 7
+    if m < 20:  return 9
+    if m < 40:  return 11
+    if m < 70:  return 12
+    if m < 120: return 13
+    return 13
 
 
 # ---------------------------------------------------------------------------
