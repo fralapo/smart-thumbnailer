@@ -1204,5 +1204,81 @@ Optional dependencies:
         print("=" * 56)
 
 
+def repair_thumbnails(thumb_dir: str, stem: str) -> None:
+    """
+    Generate report.json and preview.html from existing JPGs in thumb_dir.
+    Used when thumbnails exist but metadata files are missing.
+
+    Usage: python thumbnailer.py --repair /path/to/thumb/dir "episode stem"
+    """
+    import re as _re
+    jpgs = sorted(f for f in os.listdir(thumb_dir) if f.lower().endswith(".jpg"))
+    results = []
+    for f in jpgs:
+        m = _re.match(r"thumb_(\d+)_(\d+)m(\d+)s\.jpg", f)
+        if not m:
+            continue
+        rank = int(m.group(1))
+        mins = int(m.group(2))
+        secs = int(m.group(3))
+        results.append({
+            "rank": rank, "file": f,
+            "_abs": os.path.join(thumb_dir, f),
+            "time_sec": mins * 60 + secs,
+            "timestamp": f"{mins:02d}:{secs:02d}",
+        })
+
+    if not results:
+        print(f"No thumb_N_MMmSSs.jpg files found in {thumb_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    report_path = os.path.join(thumb_dir, "report.json")
+    with open(report_path, "w", encoding="utf-8") as fh:
+        json.dump({
+            "video": stem,
+            "thumbnails_count": len(results),
+            "thumbnails": [{k: v for k, v in r.items() if not k.startswith("_")} for r in results],
+        }, fh, indent=2)
+
+    cards = ""
+    for r in results:
+        with open(r["_abs"], "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        cards += (
+            f'<div class="card">'
+            f'<img src="data:image/jpeg;base64,{b64}">'
+            f'<div class="meta">'
+            f'<span class="rank">#{r["rank"]}</span>'
+            f'<span class="ts"> {r["timestamp"]}</span>'
+            f'</div></div>'
+        )
+
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Thumbnails</title>'
+        '<style>*{box-sizing:border-box;margin:0;padding:0}'
+        'body{font-family:system-ui;background:#0d0d0d;color:#ddd;padding:24px}'
+        '.grid{display:flex;gap:18px;flex-wrap:wrap}'
+        '.card{background:#191919;border-radius:10px;overflow:hidden;width:360px}'
+        '.card img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover}'
+        '.meta{padding:8px 12px;display:flex;gap:8px}'
+        '.rank{font-weight:700;color:#fff}'
+        '.ts{color:#777;font-size:.85rem}'
+        '</style></head>'
+        f'<body><div class="grid">{cards}</div></body></html>'
+    )
+
+    html_path = os.path.join(thumb_dir, "preview.html")
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+    print(f"  Generated report.json + preview.html ({len(results)} thumbnails)")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--repair":
+        if len(sys.argv) < 4:
+            print("Usage: thumbnailer.py --repair <thumb_dir> <stem>", file=sys.stderr)
+            sys.exit(1)
+        repair_thumbnails(sys.argv[2], sys.argv[3])
+    else:
+        main()
