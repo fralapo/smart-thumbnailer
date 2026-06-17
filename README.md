@@ -23,7 +23,7 @@ The face detector (~2 MB) downloads itself on the first run. It runs without a G
 - Zone-based diversity: splits the timeline into N equal zones, picks the top scorer from each; diversity check uses Lab Bhattacharyya distance so selected frames are perceptually distinct
 - Multi-metric scoring: colorfulness (highest weight), Tenengrad sharpness, RMS contrast, MSCN naturalness, clipping-aware exposure, spectral residual saliency, pixel-level stability, face area and position
 - dHash deduplication before full scoring (Hamming distance ≤ 12/64 bits)
-- Auto thumbnail count that scales with video duration (2 for short clips, up to 10 for feature-length)
+- Auto thumbnail count that scales with video duration (5 for short clips, up to 13 for feature-length)
 - PySceneDetect integration merges detected cut points with uniform samples when installed
 - Rotation correction via `cv2.CAP_PROP_ORIENTATION_META` for phone and action camera footage
 - Self-contained HTML report with base64-embedded JPEGs and per-frame metric bars
@@ -148,13 +148,13 @@ When `-k` is not set, count scales with duration:
 
 | Duration | Thumbnails |
 |---|---|
-| < 3 min | 2 |
-| 3–8 min | 4 |
-| 8–20 min | 6 |
-| 20–40 min | 8 |
-| 40–70 min | 9 |
-| 70–120 min | 10 |
-| > 120 min | 10 (cap) |
+| < 3 min | 5 |
+| 3–8 min | 7 |
+| 8–20 min | 9 |
+| 20–40 min | 11 |
+| 40–70 min | 12 |
+| 70–120 min | 13 |
+| > 120 min | 13 (cap) |
 
 ## How it works
 
@@ -205,6 +205,92 @@ Colorfulness is the highest-weighted metric, which is counterintuitive, but that
 - `opencv-python >= 4.5`
 - `numpy >= 1.20`
 - `scenedetect[opencv]` (optional, for scene-aware sampling)
+
+## Repair mode
+
+If thumbnails already exist but `report.json` or `preview.html` are missing, regenerate them from the existing JPGs without re-processing the video:
+
+```bash
+python thumbnailer.py --repair /path/to/thumb/dir "episode name"
+```
+
+`--repair` only requires the stdlib (no OpenCV needed), so it works even if `cv2` is unavailable.
+
+## AWS CloudShell batch processing
+
+To generate thumbnails for all videos in an S3 bucket, one at a time (to stay within CloudShell storage limits), with automatic skip of already-processed episodes and repair of incomplete ones:
+
+```bash
+# Install dependencies (run once per CloudShell session)
+pip3 install opencv-python-headless numpy scenedetect
+pip3 install --force-reinstall opencv-python-headless   # keeps headless after scenedetect
+
+# Download the script
+curl -o ~/thumbnailer.py https://raw.githubusercontent.com/fralapo/smart-thumbnailer/master/thumbnailer.py
+```
+
+Then run the batch loop (replace `your-bucket` and the prefix as needed):
+
+```bash
+BUCKET="your-bucket"
+
+aws s3 ls "s3://$BUCKET/" --recursive \
+  | grep '\.mp4$' \
+  | grep -v '/output/' \
+  | grep -v '/thumbnails/' \
+  | sed 's/^[^ ]\+ [^ ]\+ \+[^ ]\+ //' \
+  | while IFS= read -r KEY; do
+
+  FILENAME=$(basename "$KEY")
+  STEM="${FILENAME%.*}"
+  FOLDER_PREFIX="${KEY%/*}"
+  THUMB_PREFIX="${FOLDER_PREFIX}/thumbnails/${STEM}/"
+
+  JPG_COUNT=$(aws s3 ls "s3://$BUCKET/$THUMB_PREFIX" | grep -c '\.jpg$' || true)
+  HAS_REPORT=$(aws s3 ls "s3://$BUCKET/${THUMB_PREFIX}report.json" 2>/dev/null | wc -l)
+  HAS_HTML=$(aws s3 ls "s3://$BUCKET/${THUMB_PREFIX}preview.html" 2>/dev/null | wc -l)
+
+  if [ "$JPG_COUNT" -gt 0 ] && { [ "$HAS_REPORT" -eq 0 ] || [ "$HAS_HTML" -eq 0 ]; }; then
+    echo "[REPAIR] $FILENAME"
+    mkdir -p "/tmp/repair/$STEM"
+    aws s3 cp "s3://$BUCKET/$THUMB_PREFIX" "/tmp/repair/$STEM/" --recursive --exclude "*" --include "*.jpg"
+    python3 ~/thumbnailer.py --repair "/tmp/repair/$STEM" "$STEM"
+    aws s3 cp "/tmp/repair/$STEM/report.json" "s3://$BUCKET/${THUMB_PREFIX}report.json"
+    aws s3 cp "/tmp/repair/$STEM/preview.html" "s3://$BUCKET/${THUMB_PREFIX}preview.html"
+    rm -rf "/tmp/repair/$STEM"
+    echo "=== Repair Done: $FILENAME ==="
+    continue
+  fi
+
+  if [ "$JPG_COUNT" -gt 0 ]; then
+    echo "[SKIP] $FILENAME"
+    continue
+  fi
+
+  echo "=== Processing: $FILENAME ==="
+  aws s3 cp "s3://$BUCKET/$KEY" "/tmp/$FILENAME"
+  python3 ~/thumbnailer.py "/tmp/$FILENAME" --no-faces -s 10 -o "/tmp/thumbnails/$STEM/"
+  aws s3 cp "/tmp/thumbnails/$STEM/" "s3://$BUCKET/$FOLDER_PREFIX/thumbnails/$STEM/" --recursive
+  rm -f "/tmp/$FILENAME"
+  rm -rf "/tmp/thumbnails/$STEM/"
+  echo "=== Done: $FILENAME ==="
+done
+```
+
+Thumbnails are stored alongside the source videos:
+
+```
+serie/show/
+├── episode.mp4
+└── thumbnails/
+    └── episode/
+        ├── thumb_1_01m05s.jpg
+        ├── ...
+        ├── report.json
+        └── preview.html
+```
+
+The loop is safe to interrupt and rerun: already-complete episodes are skipped, incomplete ones are repaired.
 
 ## License
 
