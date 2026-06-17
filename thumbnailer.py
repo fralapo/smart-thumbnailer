@@ -26,8 +26,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-import cv2
-import numpy as np
+try:
+    import cv2
+    import numpy as np
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 # ---------------------------------------------------------------------------
 # Optional: PySceneDetect for scene-aware sampling
@@ -1281,4 +1285,7 @@ if __name__ == "__main__":
             sys.exit(1)
         repair_thumbnails(sys.argv[2], sys.argv[3])
     else:
+        if not HAS_CV2:
+            print("Error: opencv-python-headless not installed. Run: pip3 install opencv-python-headless numpy", file=sys.stderr)
+            sys.exit(1)
         main()
